@@ -1,0 +1,7 @@
+CW1/data/** filter=lfs diff=lfs merge=lfs -text
+CW1/train_features/** filter=lfs diff=lfs merge=lfs -text
+CW1/probes/** filter=lfs diff=lfs merge=lfs -text
+CW1/figures/** filter=lfs diff=lfs merge=lfs -text
+CW1/images_conditional/** filter=lfs diff=lfs merge=lfs -text
+CW1/images_conditional_cfg/** filter=lfs diff=lfs merge=lfs -text
+CW1/images_unconditional/** filter=lfs diff=lfs merge=lfs -text

@@ -1,0 +1,18 @@
+Evaluating clip finetuned model...
+clip finetune photo-val accuracy: 0.8940
+Evaluating dino finetuned model...
+dino finetune photo-val accuracy: 0.8800
+Evaluating mae finetuned model...
+mae finetune photo-val accuracy: 0.8860
+
+
+    split_name: str,
+    feature_extractor: torch.nn.Module,
+    pretrained_linear_probe: torch.nn.Module = None,
+    num_epochs: int = 2,
+    batch_size: int = 32,
+    feature_lr: float = 1e-5,
+    head_lr: float = 1e-3,
+    weight_decay: float = 1e-4,
+    num_workers: int = 4,
+    device: str = "cuda:0",

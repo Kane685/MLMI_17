@@ -1,0 +1,250 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision
+import torchvision.transforms as transforms
+import torchvision.utils as vutils
+import matplotlib.pyplot as plt
+import math
+import numpy as np
+import einops
+from pathlib import Path
+from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
+from DIT import DiT
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+IMAGE_SIZE = 32
+PATCH_SIZE = 4
+DIM = 256
+DEPTH = 4
+HEADS = 4
+MLP_RATIO = 4.0
+CHANNELS = 1
+BATCH_SIZE = 128
+EPOCHS = 40
+LR = 3e-4
+T = 500
+device = "cuda"
+
+
+# ============================================================================
+# DDPM UTILS
+# ============================================================================
+
+
+def get_ddpm_schedule(T):
+    betas = torch.linspace(1e-4, 0.02, T).to(device)
+    alphas = 1.0 - betas
+    alphas_cumprod = torch.cumprod(alphas, dim=0)
+    return betas, alphas, alphas_cumprod
+
+
+def forward_diffusion(x0, t, alphas_cumprod):
+    ### YOUR CODE STARTS HERE ###
+    # Your code should compute xt at timestep t, and also return the noise
+    alpha_bar_t = alphas_cumprod[t]
+    unit_noise = torch.randn_like(x0)
+    coe = torch.sqrt(1-alpha_bar_t)
+    shape = [coe.shape[0]] + [1] * (x0.ndim - 1)
+    noise = unit_noise * coe.view(shape)
+    coe = torch.sqrt(alpha_bar_t)
+    shape = [coe.shape[0]] + [1] * (x0.ndim - 1)
+    xt = coe.view(shape) * x0 + noise
+    ### YOUR CODE ENDS HERE ###
+    return xt, unit_noise
+
+
+@torch.no_grad()
+def sample_ddpm(net, T, bsz, betas, alphas, alphas_cumprod, num_snapshots=10, labels = None):
+    net.eval()
+
+    # sample the initial noise
+    x = torch.randn(bsz, CHANNELS, IMAGE_SIZE, IMAGE_SIZE, device=device)
+    if labels is None:
+        c = torch.randint(0, 10, (bsz,), device=device).long()
+    else:
+        c = labels.to(device).long()
+
+    # Identify which timesteps to save for the visualization grid
+    snapshot_indices = torch.linspace(T - 1, 0, num_snapshots).long()
+    snapshots = []
+
+    for t in reversed(range(T)):
+
+        ### YOUR CODE STARTS HERE ###
+        # Your code should compute xt at timestep t
+        beta_t = betas[t]
+        alpha_t = alphas[t]
+        alpha_bar_t = alphas_cumprod[t]
+        sigma_t = torch.sqrt(beta_t)
+        if t != 0:
+            z = torch.randn_like(x)
+        else:
+            z = torch.zeros_like(x)
+        t_batch = torch.empty((bsz,), dtype=torch.long, device=device).fill_(t)
+        noise = net(x, t_batch, c)
+        x = sigma_t*z + (x - ((1-alpha_t)/(torch.sqrt(1-alpha_bar_t)))*noise) / torch.sqrt(alpha_t)
+        ### YOUR CODE ENDS HERE ###
+
+        if t in snapshot_indices:
+            snapshots.append(x.cpu())
+
+    # Return shape: (num_snapshots, bsz, C, H, W)
+    return torch.stack(snapshots), c.cpu()
+
+
+def visualize_forward_diffusion(dataloader, alphas_cumprod, n_steps=10):
+    # Get a batch of real images
+    images, _ = next(iter(dataloader))
+    images = images[:8]
+
+    # Select timesteps to show (0 to T-1)
+    indices = torch.linspace(0, T - 1, n_steps).long()
+
+    cols = []
+    for t in indices:
+        t_batch = torch.full((images.shape[0],), t, dtype=torch.long)
+        # Apply the forward diffusion
+        xt, _ = forward_diffusion(images.to(device), t_batch.to(device), alphas_cumprod)
+        cols.append(xt.cpu())
+
+    # Stack and rearrange: (Steps, Batch, C, H, W) -> (Batch * Steps, C, H, W)
+    result = torch.stack(cols, dim=1)
+    result = einops.rearrange(result, "b t c h w -> (b t) c h w")
+
+    grid = vutils.make_grid(result, nrow=n_steps, normalize=True, value_range=(-1, 1))
+
+    plt.figure(figsize=(15, 8))
+    plt.imshow(grid.permute(1, 2, 0).numpy())
+    plt.axis("off")
+    plt.savefig("images_conditional/forward_diffusion_process.png")
+    plt.show()
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+if __name__ == "__main__":
+    Path("images_conditional").mkdir(exist_ok=True)
+
+    # 1. Data Setup
+    transform = transforms.Compose(
+        [
+            transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+            transforms.ToTensor(),
+            transforms.Normalize((0.5,), (0.5,)),
+        ]
+    )
+    train_dataset = torchvision.datasets.MNIST(
+        root="./data", train=True, download=True, transform=transform
+    )
+    dataloader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=2
+    )
+
+    # 2. Model Setup
+    net = DiT(
+        input_size=IMAGE_SIZE,
+        patch_size=PATCH_SIZE,
+        in_channels=CHANNELS,
+        hidden_size=DIM,
+        depth=DEPTH,
+        num_heads=HEADS,
+        mlp_ratio=MLP_RATIO,
+        num_classes=10,
+        learn_sigma=False,
+    ).to(device)
+    print(f"Parameters: {sum(p.numel() for p in net.parameters()):,}")
+
+    optimizer = optim.AdamW(net.parameters(), lr=LR)
+    # get noise schedule parameters
+    betas, alphas, alphas_cumprod = get_ddpm_schedule(T)
+
+    # Visualize the forward process before training
+    visualize_forward_diffusion(dataloader, alphas_cumprod)
+
+    # 3. Training Loop
+    print("Starting Training...")
+    loss_history = []
+
+    for epoch in range(EPOCHS):
+        net.train()
+        epoch_loss = 0
+        for i, (images, labels) in enumerate(dataloader):
+            images = images.to(device)
+            labels = labels.to(device)
+            bsz = images.shape[0]
+
+            # Sample random timesteps
+            t = torch.randint(0, T, (bsz,), device=device).long()
+
+            # Add noise
+            xt, noise = forward_diffusion(images, t, alphas_cumprod)
+
+            # Predict noise
+            pred_noise = net(xt, t, labels)
+
+            # Use MSE loss
+            loss = nn.functional.mse_loss(pred_noise, noise)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            epoch_loss += loss.item()
+
+        avg_loss = epoch_loss / len(dataloader)
+        loss_history.append(avg_loss)
+        print(f"Epoch {epoch+1}/{EPOCHS} | Loss: {avg_loss:.4f}")
+
+        # Inside the training loop:
+        if (epoch + 5) % 5 == 0:
+            num_samples = 8
+            num_steps = 10  # How many steps of the process to show
+
+            # Generate the trajectory
+            # Shape: (num_steps, num_samples, C, H, W)
+            traj, _ = sample_ddpm(
+                net, T, num_samples, betas, alphas, alphas_cumprod, num_steps
+            )
+
+            grid_ready = einops.rearrange(traj, "s b c h w -> b s c h w")
+            grid_ready = einops.rearrange(grid_ready, "b s c h w -> (b s) c h w")
+
+            # Create the grid
+            grid = vutils.make_grid(
+                grid_ready, nrow=num_steps, normalize=True, value_range=(-1, 1)
+            )
+
+            # Save the result
+            vutils.save_image(grid, f"images_conditional/evolution_epoch_{epoch+1}.png")
+            print(
+                f"Epoch {epoch+1}: Saved generation grid to images_conditional/evolution_epoch_{epoch+1}.png"
+            )
+
+    # 4. Final Sampling & Visualization
+    print("Generating Final Samples...")
+    labels = torch.arange(10, device=device)
+    trajectory, labels_cpu = sample_ddpm(
+        net, T, bsz=10, betas=betas, alphas=alphas, alphas_cumprod=alphas_cumprod, labels=labels
+    )
+    final_imgs = trajectory[-1]  # [10, 1, H, W]
+    fig, axes = plt.subplots(1, 10, figsize=(20, 3))
+    for i, ax in enumerate(axes):
+        img = final_imgs[i].squeeze(0).clamp(-1, 1)
+        img = (img + 1) / 2  # [-1,1] -> [0,1]
+        ax.imshow(img.numpy(), cmap="gray")
+        ax.set_title(f"label={int(labels_cpu[i])}")
+        ax.axis("off")
+    plt.tight_layout()
+    plt.savefig("images_conditional/dit_mnist_final_labeled.png")
+
+    # Save Loss Plot
+    plt.figure()
+    plt.plot(loss_history)
+    plt.title("Training Loss")
+    plt.savefig("images_conditional/loss_curve.png")
+
+    print("Done! Check the 'images_conditional' folder.")
